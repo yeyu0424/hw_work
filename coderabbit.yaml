@@ -1,0 +1,1021 @@
+我把 CodeRabbit 的公开资料按“产品行为 → 检视流程 → Context Engine → Agent/Harness → 工具执行 → Verification → 反馈学习 → 基础设施”重新整理了一遍。下面重点不是产品介绍，而是尽量还原它背后的代码审查系统是怎么工作的。
+先给结论：
+CodeRabbit 的核心不是“用一个大模型看 diff”，而是一个以 Context Engineering 为中心、由确定性分析 + Agentic Exploration + 多 Agent Verification + Model Routing + Sandbox + Evaluation 组成的专用 Code Review Harness。
+这点在它 2026 年最新的官方 Architecture 文档里已经讲得非常明确：每次 review 都会经过沙箱、50+ 静态分析/linters/SAST、Agentic Exploration、Review/Verification 等专用 Agent，以及长期积累的 Knowledge Base。
+一、先还原 CodeRabbit 的整体检视流程
+可以把公开信息整理成下面这条主链：
+                  PR / Commit / IDE Change
+                           │
+                           ▼
+                ┌─────────────────────┐
+                │ 1. Review Trigger   │
+                │ GitHub/GitLab/IDE   │
+                └─────────┬───────────┘
+                          │
+                          ▼
+                ┌─────────────────────┐
+                │ 2. Review Admission │
+                │ branch/user/path    │
+                │ PR filters/config   │
+                └─────────┬───────────┘
+                          │
+                          ▼
+          ┌──────────────────────────────────┐
+          │ 3. Isolated Execution Sandbox    │
+          │ clone repo / deps / build env    │
+          └────────────────┬─────────────────┘
+                           │
+             ┌─────────────┼───────────────┐
+             │             │               │
+             ▼             ▼               ▼
+      Static Analysis   Context Engine   Repo Explore
+      50+ analyzers     / Knowledge       Agent
+      linters/SAST      sources           │
+             │             │               │
+             └─────────────┼───────────────┘
+                           ▼
+                ┌─────────────────────┐
+                │ 4. Context Assembly│
+                │ Intent              │
+                │ Environment         │
+                │ Conversation        │
+                └─────────┬───────────┘
+                          │
+                          ▼
+                ┌─────────────────────┐
+                │ 5. Review Agent     │
+                │ candidate findings  │
+                │ code understanding  │
+                │ impact analysis     │
+                └─────────┬───────────┘
+                          │
+                   candidate comments
+                          │
+                          ▼
+                ┌─────────────────────┐
+                │ 6. Verification     │
+                │ agents / evidence   │
+                │ guidelines / config │
+                │ relevance / FP      │
+                └─────────┬───────────┘
+                          │
+                          ▼
+                ┌─────────────────────┐
+                │ 7. Quality Gates    │
+                │ pre-merge checks    │
+                │ CI failures         │
+                │ custom checks       │
+                └─────────┬───────────┘
+                          │
+                          ▼
+                ┌─────────────────────┐
+                │ 8. Publish Review   │
+                │ inline comments     │
+                │ walkthrough         │
+                │ summary / labels    │
+                └─────────┬───────────┘
+                          │
+                          ▼
+                ┌─────────────────────┐
+                │ 9. Feedback Loop    │
+                │ chat / resolution   │
+                │ learnings / history │
+                └─────────────────────┘
+这是对官方资料的工程化归纳，不是 CodeRabbit 公布的一份逐节点内部源码流程图。官方明确说明其 review pipeline 是 non-linear pipeline，会并行/多阶段收集上下文，并在生成 comment 后通过 verification agents 再检查。
+二、第一层：Review Trigger
+CodeRabbit 的 review 并不只有一种入口。
+目前公开资料能看到：
+PR 自动 Review
+新 commit 的 incremental review
+@coderabbitai review
+@coderabbitai full review
+IDE 内 review
+CI/CD failure analysis
+Pre-Merge Checks
+Chat/Agent 驱动的进一步分析
+其中一个很关键的设计是：
+Incremental Review
+当 PR 已经 review 过，再 push 新 commit，CodeRabbit 不会默认把整个 PR 重新看一遍，而是计算“上次 review 之后发生了什么变化”。官方把它定义为 incremental review。
+可以抽象为：
+PR:
+  commit A ── commit B ── commit C ── commit D
+                    ↑
+              last reviewed
+
+new review scope =
+    diff(C..D)
+
+而不是：
+
+    diff(A..D)
+这对自己的 Code Review Harness 很值得借鉴，因为：
+review 成本最大的不是第一次，而是 PR 反复修改后的 N 次重复 review。
+三、第二层：Review Admission / Scope Control
+CodeRabbit 不会简单地：
+收到 PR → LLM review entire diff
+而是在进入真正的 Agent 阶段前，先定义：
+“这次究竟要检查什么？”
+公开配置里已经有比较完整的 scope 控制：
+PR 级过滤
+例如：
+ignore_title_keywords:
+  - WIP
+  - DO NOT MERGE
+也可以排除机器人账号。
+Path Filter
+例如：
+path_filters:
+  - "!dist/**"
+  - "!node_modules/**"
+  - "!**/package-lock.json"
+默认就会过滤大量：
+build artifacts
+generated files
+lock files
+dependency directories
+binary/media 等
+官方明确把这个定义为 review scope 控制。
+Path Instructions
+这一步特别有意思：
+path_instructions:
+  - path: "src/controllers/**"
+    instructions: |
+      Focus on authentication,
+      authorization and input validation.
+
+  - path: "tests/**"
+    instructions: |
+      Check edge cases and error paths.
+也就是说 CodeRabbit 的规则不是只有：
+global prompt
+而是：
+Global rules
+      +
+Repository rules
+      +
+Path rules
+      +
+AST structural rules
+      +
+Contextual rules
+这是一个非常典型的 hierarchical review policy system。
+四、第三层：Sandbox + Repo Clone
+这是 CodeRabbit 工程上非常值得研究的一部分。
+Google Cloud 对 CodeRabbit 的技术介绍公开了比较具体的架构：
+GitHub/GitLab webhook
+          │
+          ▼
+Cloud Run Handler
+          │
+          ▼
+Cloud Tasks
+          │
+          ▼
+Review Execution Service
+          │
+          ▼
+Sandbox
+CodeRabbit 会：
+clone repository
+创建 build environment
+安装依赖
+运行静态分析
+执行 Agent 生成的脚本
+对整个 repo 做进一步分析
+例如：
+npm install
+go mod download
+...
+grep
+cat
+ast-grep
+Python analysis
+shell scripts
+curl external services
+这些都是官方由 Google Cloud 文章披露的。
+五、为什么 Sandbox 是 CodeRabbit 的核心，而不是“部署细节”
+因为它不是单纯读文本。
+它允许 Agent：
+read repo
+      ↓
+search repo
+      ↓
+run static analyzer
+      ↓
+run AST search
+      ↓
+execute generated script
+      ↓
+inspect dependencies
+      ↓
+run Python analysis
+这实际上已经非常接近：
+Code Agent Harness
+而不是简单 LLM API。
+Google Cloud 资料还明确指出，CodeRabbit 对不可信代码采用多层 sandbox：
+Cloud Run isolation
+        +
+microVM
+        +
+Jailkit
+        +
+cgroups
+        +
+minimal IAM
+目的是防止：
+用户 repo 中的恶意代码
+LLM 自动生成脚本
+自定义 lint 插件
+Python 分析脚本
+逃逸 review 环境。
+这对你之前研究的 Code Review Harness 非常重要：
+Review Agent 能不能执行代码，决定了你的系统是“LLM 评论器”，还是“真正的 Code Review Agent”。
+六、第四层：确定性分析层
+这是 CodeRabbit 很容易被低估的一层。
+它并不是：
+LLM → review
+而是：
+              PR
+               │
+      ┌────────┼────────┐
+      │        │        │
+      ▼        ▼        ▼
+   Linter     SAST    Code/AST
+      │        │        │
+      └────────┼────────┘
+               ▼
+          Context Engine
+目前 CodeRabbit 官方架构文档已经写成：
+50+ static analyzers, linters and SAST tools。
+而 2025 年 Google Cloud 的技术文章当时披露的是：
+20+ linters and security scanners。
+也就是说，这个能力在持续扩大。
+工具不是直接作为“最终结论”，而更像是：
+Static Tool Output
+        ↓
+Evidence / Signal
+        ↓
+Context Engineering
+        ↓
+LLM reasoning
+这非常关键。
+七、第五层：Context Engineering —— CodeRabbit 真正的核心
+如果让我只选 CodeRabbit 最值得研究的一个技术点：
+Context Engine
+官方 2025 年文章直接把它定义成核心方法，并把 context 拆成三个维度：
+1. Intent
+Why is this change being made?
+来源包括：
+PR title
+PR description
+issue
+Jira
+Linear
+用户意图
+2. Environment
+What is the current technical state?
+包括：
+文件关系
+dependency
+code graph
+repository structure
+existing patterns
+3. Conversation
+What happened during the reasoning?
+包括：
+chat
+previous agent outputs
+tool calls
+tool results
+官方明确就是这么描述的。
+八、CodeRabbit 收集哪些 Context
+从公开资料可以拼出一个非常完整的 Context Matrix：
+Context	来源	用途
+Diff	PR	当前变化
+PR metadata	PR title/description	理解意图
+Linked Issue	GitHub/GitLab/Jira/Linear	理解业务需求
+Repository	repo	理解整体架构
+Code Graph	graph	dependency / impact
+Past PR	历史 PR	类似改动
+Learnings	chat/history	团队偏好
+Coding Guidelines	repo docs	规范
+Path Instructions	YAML	局部策略
+AST rules	ast-grep	结构化检查
+Static Analysis	linter/SAST	确定性证据
+Linked repos	multi-repo	跨仓库影响
+MCP	external systems	企业内部上下文
+Web Search	public web	最新 API/docs
+CI logs	CI/CD	构建/测试失败
+CodeRabbit 的 Knowledge Base 官方文档已经把其中大部分直接列为正式能力。
+九、一个特别值得学习的设计：Context Distillation
+这是 CodeRabbit 2026 年公开资料里更值得注意的部分。
+它后来提出：
+不是把整个 repo 扔给 LLM，而是对每一种 context 做一层 distillation。
+例如：
+Code Graph
+   ↓
+relevant nodes
+   ↓
+relevant dependency paths
+   ↓
+summary
+
+MCP
+   ↓
+relevant records
+   ↓
+relevant facts
+   ↓
+summary
+
+Documentation
+   ↓
+relevant sections
+   ↓
+compressed context
+然后：
+Diff
+ +
+Distilled Context
+ +
+Review Instructions
+才进入 Reviewer Agent。
+CodeRabbit 2026 年公开文章把这种方式称为 context discipline，并强调每一个 context source 都先做 relevance processing，而不是让 agent 自己无限探索。
+这点对于 Harness 设计非常重要：
+差的设计
+Agent:
+  “自己去 repo 里找相关东西”
+CodeRabbit 风格
+Context Engine
+      ↓
+先知道应该去哪里
+      ↓
+只提供高价值上下文
+      ↓
+Agent reasoning
+十、Code Graph 是关键基础设施
+CodeRabbit 明确提到会建立：
+graph representation of code dependencies
+用来理解：
+A.py
+ ↓
+B.py
+ ↓
+C.py
+ ↓
+database
+或者：
+API
+ │
+ ├── Controller
+ │     │
+ │     └── Service
+ │             │
+ │             └── Repository
+ │
+ └── Client
+于是一个 diff：
+- API contract old
++ API contract new
+Agent 可以进一步推导：
+API changed
+     ↓
+backend consumer
+     ↓
+frontend caller
+     ↓
+mobile client
+而不是只看 PR 中被修改的文件。
+现在 CodeRabbit 甚至已经支持 Multi-Repo Analysis，通过 linked repositories 发现跨 repo：
+API breaking changes
+type mismatch
+dependency drift
+schema impacts
+官方文档明确说明了这条链路。
+十一、第六层：Review Agent
+经过前面的 context preparation，才真正进入 Reviewer Agent。
+它的任务不是：
+“帮我看看代码有没有问题。”
+而是经过结构化 prompt 后做：
+Understand intent
+      ↓
+Understand changed code
+      ↓
+Understand dependencies
+      ↓
+Identify risk
+      ↓
+Generate candidate findings
+CodeRabbit 官方公开资料里把它描述成：
+Review Agent surfaces possible comments.
+随后再进入 Verification Agents。
+十二、Review Agent 为什么不是最终决策者
+这是 CodeRabbit 设计最重要的一点之一：
+Reviewer Agent
+      │
+      ▼
+candidate findings
+      │
+      ▼
+Verification Agents
+      │
+      ├── relevant?
+      ├── correct?
+      ├── supported by evidence?
+      ├── follows guidelines?
+      ├── matches configuration?
+      └── worth showing?
+      │
+      ▼
+Final Comment
+官方直接说：
+每一条 suggestion 在发送到 PR 前都会进行 post-generation verification。
+而 2026 年的文章进一步明确：
+Review agent 负责发现，verification agents 负责过滤。
+十三、Verification Agent 实际上解决什么问题？
+主要就是：
+1. False Positive
+“这里可能有 bug”
+Verification：
+看完整调用链
+      ↓
+发现这个 case 实际不成立
+      ↓
+drop
+2. Coding Convention
+违反一般最佳实践？
+但是：
+本 repo 恰好允许这样写
+于是：
+drop
+3. Configuration
+例如：
+这个仓库不要求 docstring
+那么：
+docstring finding
+    ↓
+reject
+4. Evidence
+Verification agent 可以继续调用工具验证：
+grep
+ast-grep
+repo search
+MCP
+web
+shell
+CodeRabbit 的 Custom Checks 文档公开说明了这一点：Agent 可以使用代码搜索、AST-grep、sandbox shell、web lookup、MCP 等手段来收集证据，然后再判断。
+十四、这是一个很典型的“Generate → Verify”范式
+可以抽象为：
+         Generator
+             │
+             ▼
+     candidate findings
+             │
+             ▼
+        verifier
+             │
+       ┌─────┴─────┐
+       ▼           ▼
+     valid        invalid
+       │             │
+       ▼             X
+   confidence
+       │
+       ▼
+    publish
+而不是：
+LLM output → publish
+这其实就是 CodeRabbit 的 Precision Engineering。
+对于 Code Review，往往：
+100 个发现
+并不比：
+8 个真正重要的问题
+更好。
+所以它实际上在优化：
+Precision × Recall × Developer Trust
+而不是单纯追求“发现数量”。
+十五、第七层：Pre-Merge Checks
+CodeRabbit 现在已经把“Review”和“Quality Gate”进一步分开。
+Review：
+这里可能存在问题
+Pre-Merge Check：
+这个 PR 是否满足必须条件
+比如：
+PR title
+PR description
+docstring coverage
+linked issue
+breaking API documentation
+sensitive data
+migration policy
+custom architecture rules
+这些都可以定义成：
+warning
+或者：
+error
+在 Request Changes Workflow 下甚至可以阻止 merge。
+这意味着 CodeRabbit 的系统已经从：
+AI Code Review
+演进成：
+AI Code Quality Gate
+十六、第八层：CI/CD Failure Analysis
+还有一条独立链路：
+PR
+ ↓
+CI
+ ↓
+test/build failure
+ ↓
+CodeRabbit reads logs
+ ↓
+root cause
+ ↓
+map back to code
+ ↓
+inline suggestion
+官方现在支持读取：
+GitHub Actions
+GitLab CI/CD
+CircleCI
+Azure DevOps Pipelines
+并针对：
+build failure
+test failure
+SAST/DAST
+IaC
+linter
+做 inline suggestions。
+这意味着一个成熟的 Review Harness 不应该只吃：
+git diff
+还应该吃：
+diff
++
+static analysis
++
+test
++
+build
++
+CI logs
+十七、第九层：长期 Memory / Learnings
+CodeRabbit 有一个我认为非常值得直接移植的设计：
+Review feedback → persistent learning
+例如用户在 Chat 中告诉它：
+这个项目里：
+不要建议把 UUID 改成 string
+系统会形成一个 learning。
+以后：
+新的 PR
+ ↓
+load applicable learnings
+ ↓
+作为 review context
+官方明确写了：
+learnings 存在内部数据库
+按 repo / organization scope 管理
+后续 review 会加载适用的 learning。
+这其实是：
+Short-term conversation
+          ↓
+Persistent review policy
+          ↓
+Future reviews
+十八、Knowledge Base 的完整模型
+现在 CodeRabbit 的 Knowledge Base 已经可以理解成：
+                     Knowledge Base
+                           │
+        ┌──────────────────┼─────────────────┐
+        │                  │                 │
+        ▼                  ▼                 ▼
+    Learnings         Code Guidelines   Historical PRs
+        │                  │                 │
+        └──────────┬───────┴─────────┬───────┘
+                   │                 │
+                   ▼                 ▼
+                Issues          Linked Repos
+                   │                 │
+                   └────────┬────────┘
+                            │
+                    ┌───────┴───────┐
+                    ▼               ▼
+                   MCP          Web Search
+官方 Knowledge Base 页面目前明确包括：
+Learnings
+Code Guidelines
+Multi-Repo Analysis
+MCP
+Web Search
+Issues / historical PR context。
+十九、一个非常漂亮的设计：外部 Context 不只是 RAG
+传统 RAG：
+query
+ ↓
+vector search
+ ↓
+chunks
+ ↓
+LLM
+CodeRabbit 更接近：
+PR
+ │
+ ├── code graph
+ ├── PR history
+ ├── issues
+ ├── guidelines
+ ├── learnings
+ ├── MCP
+ ├── web
+ ├── static analysis
+ │
+ ▼
+Context Selection
+ │
+ ▼
+Context Distillation
+ │
+ ▼
+Review Prompt
+所以它实际上不是单纯的：
+RAG for Code Review
+而是：
+Context Orchestration for Code Review
+二十、MCP 在这里扮演什么角色
+CodeRabbit 已经把 MCP 纳入 review context。
+例如：
+CodeRabbit
+    │
+    ▼
+MCP Client
+    │
+    ├── internal docs
+    ├── Jira
+    ├── design tools
+    ├── internal API
+    └── enterprise knowledge
+然后：
+external context
+        ↓
+review enrichment
+        ↓
+comment
+官方文档说明它会在 review/chat 期间自动调用相关 MCP tools 获取上下文。
+这意味着 Code Review Agent 的 Context 不再局限于 Git repository。
+二十一、Web Search 也被当成 Context Source
+CodeRabbit 当前官方文档显示，review 时可以：
+PR
+ ↓
+发现使用某个 API / library
+ ↓
+Web Search
+ ↓
+获取最新官方文档
+ ↓
+验证 API 行为
+ ↓
+形成 review
+而不是完全依赖 LLM 训练数据。
+官方文档现在将 Web Search 作为 Knowledge Base 的正式 context source，并默认启用。
+这对：
+AWS SDK
+Kubernetes API
+React
+Spring
+Terraform
+新版本 SDK
+尤其重要。
+二十二、模型层：CodeRabbit 不是“一模型到底”
+2026 年公开资料里，这一点越来越明显。
+它现在明确强调：
+Smart LLM Routing
+不同任务使用不同模型：
+Context Distillation
+       ↓
+   compact model
+
+Reasoning / Review
+       ↓
+ frontier reasoning model
+
+Verification
+       ↓
+ appropriate model
+
+Simple classification
+       ↓
+ cheap/fast model
+CodeRabbit 自己公开说，它会根据任务复杂度做 model routing，并通过持续 eval 来决定哪个模型适合什么任务。
+这比：
+所有任务 → Claude/GPT 最大模型
+更加工程化。
+二十三、Prompt 设计也是分层的
+公开资料提到它会根据：
+file complexity
+file importance
+review depth
+选择不同 prompt / model。
+所以其大致形态是：
+simple file
+   ↓
+basic review prompt
+
+important business logic
+   ↓
+deeper reasoning prompt
+
+architecture-impacting change
+   ↓
+architectural analysis prompt
+官方还公开过一个很值得注意的比例：
+平均 code : context ≈ 1 : 1。
+这并不意味着每一次实际请求都机械保持 1:1，而更像是在强调：
+上下文本身需要和代码一样被认真设计。
+二十四、非线性 Pipeline：非常重要
+CodeRabbit 多次使用：
+non-linear review pipeline
+这个词。
+我理解其工程含义不是：
+Step 1
+ ↓
+Step 2
+ ↓
+Step 3
+ ↓
+Step 4
+而是：
+                    PR
+                     │
+        ┌────────────┼────────────┐
+        ▼            ▼            ▼
+      Diff        CodeGraph     Issues
+        │            │            │
+        ▼            ▼            ▼
+      Linter       Explorer      KB
+        │            │            │
+        └────────────┼────────────┘
+                     ▼
+              Context Builder
+                     │
+                     ▼
+               Review Agent
+                  │     │
+          ┌───────┘     └───────┐
+          ▼                     ▼
+      verifier A            verifier B
+          │                     │
+          └──────────┬──────────┘
+                     ▼
+                 aggregator
+也就是说：
+上下文准备、工具分析、Agent reasoning、verification 可以形成并行/反馈关系。
+这就是它和单 Agent Code Review 最大的架构差异之一。
+二十五、CodeRabbit 的 Harness 可以抽象成这 10 个核心组件
+如果从你最近研究的 “如何基于 Harness 做 Code Review” 角度，把它压缩成架构模块，我会拆成：
+1. Event Gateway
+   └─ PR / commit / CI / IDE
+
+2. Review Orchestrator
+   └─ workflow / DAG
+
+3. Repo Sandbox
+   └─ clone / build / execute
+
+4. Static Analysis Layer
+   └─ lint / SAST / AST / test / CI
+
+5. Context Engine
+   ├─ diff
+   ├─ code graph
+   ├─ PR intent
+   ├─ history
+   ├─ knowledge
+   ├─ MCP
+   └─ web
+
+6. Context Distiller
+   └─ ranking / compression / dedup
+
+7. Review Agents
+   ├─ reviewer
+   ├─ explorer
+   └─ specialist agents
+
+8. Verification Layer
+   ├─ evidence checker
+   ├─ guideline checker
+   ├─ false-positive filter
+   └─ severity classifier
+
+9. Quality Gate
+   ├─ pre-merge checks
+   ├─ CI checks
+   └─ policy engine
+
+10. Learning / Evaluation
+    ├─ feedback
+    ├─ learnings
+    ├─ benchmark
+    ├─ model routing
+    └─ prompt evaluation
+这个结构基本就是我认为最值得从 CodeRabbit 中抽取的 Review Harness Blueprint。
+二十六、CodeRabbit 真正的“护城河”在哪里
+我把它总结成 6 个层面：
+能力	价值
+Context Engineering	决定 Agent 到底“懂不懂代码”
+Deterministic Analysis	给 LLM 提供可靠证据
+Agent Exploration	处理复杂跨文件问题
+Verification Agents	抑制 hallucination / false positive
+Model Routing	控制质量、速度、成本
+Persistent Learning	让 review 越用越贴合团队
+所以真正的架构不是：
+LLM
+而是：
+LLM
++
+Context
++
+Tools
++
+Sandbox
++
+Verification
++
+Memory
++
+Evaluation
+二十七、如果把它转成你自己的 Code Review Harness
+我建议你不要直接照抄一个“大 Agent”。
+更合理的第一版结构应该是：
+                    ┌─────────────┐
+                    │ Git Provider│
+                    └──────┬──────┘
+                           │
+                           ▼
+                    Review Orchestrator
+                           │
+             ┌─────────────┼─────────────┐
+             │             │             │
+             ▼             ▼             ▼
+          Diff Agent    Static Tools   Context Agent
+             │             │             │
+             └─────────────┼─────────────┘
+                           ▼
+                     Context Builder
+                           │
+                           ▼
+                      Review Agent
+                           │
+                     candidate issues
+                           │
+                           ▼
+                   Verification Agent
+                           │
+                  ┌────────┴────────┐
+                  ▼                 ▼
+               accepted          rejected
+                  │
+                  ▼
+                PR Bot
+                  │
+                  ▼
+            Feedback / Learning
+其中真正应该优先投入工程资源的不是 UI，而是下面 5 个：
+① Context Engine
+diff
++
+call graph
++
+dependency
++
+history
++
+issue
++
+coding rules
+② Verification
+不要：
+review_result = llm(...)
+post(review_result)
+而应该：
+candidates = reviewer(...)
+verified = verifier(candidates, evidence, policy)
+publish(verified)
+③ Sandbox
+允许 Agent：
+grep
+rg
+ast-grep
+git
+tests
+build
+custom scripts
+但是全部在隔离环境中执行。
+④ Incremental Review
+保存：
+last_reviewed_commit
+然后：
+new_review_scope = diff(last_reviewed_commit, current_commit)
+⑤ Evaluation Harness
+持续测：
+Recall
+Precision
+False Positive Rate
+Latency
+Token Cost
+Developer Acceptance
+CodeRabbit 在最新公开资料中已经明确把 evaluation framework 作为其 Harness 的一部分，并用于评估 model、prompt 和 context strategy。
+二十八、尤其值得注意的一条：CodeRabbit 已经从“Code Review Bot”变成“Software Change Verification System”
+这是我看完其 2026 年资料之后比较明显的判断。
+早期模型：
+PR
+ ↓
+AI Review
+ ↓
+Comments
+现在更接近：
+                 Software Change
+                       │
+          ┌────────────┼────────────┐
+          ▼            ▼            ▼
+       Intent      Implementation  Impact
+          │            │            │
+          └────────────┼────────────┘
+                       ▼
+                  Verification
+                       │
+        ┌──────────────┼─────────────┐
+        ▼              ▼             ▼
+      Review        Pre-Merge       CI
+        │              │             │
+        └──────────────┼─────────────┘
+                       ▼
+                   Quality Gate
+                       │
+                       ▼
+                     Merge
+CodeRabbit 2026 年已经把自己的定位直接往 verification layer / quality gate 方向延伸，并强调“review intent”，而不仅仅是 review diff。
+二十九、建议重点阅读的资料
+我按“最值得研究 → 次要”排序：
+1. 官方 Architecture
+最重要，快速了解整体系统。
+CodeRabbit Architecture：The System Behind Every Review Comment
+它现在明确列出了 Sandbox、50+ analyzers、Agentic exploration、Review/Verification agents、Living memory 等核心组件。
+2. Context Engineering
+这是理解 CodeRabbit 核心实现方式最重要的一篇。
+The art and science of context engineering for AI code reviews
+重点看：
+Intent / Environment / Conversation
+Context collection
+Code graph
+Historical learning
+Prompt assembly
+Verification agents。
+3. 2026 Explainable Review / Context Engine
+这是目前最接近“新一代 CodeRabbit Harness”描述的一篇。
+Explainable reviews: CodeRabbit Review and the context engine that make it possible
+重点关注：
+Context retrieval
+Ranking
+Filtering
+Model routing
+Verification
+Evaluation harness。
+4. Google Cloud Architecture
+这是公开资料中最有工程细节的一篇。
+Google Cloud：How CodeRabbit built its AI code review agent
+重点看：
+Cloud Tasks
+Cloud Run
+Sandbox
+Repo clone
+20+ → 后续扩展到 50+ analyzers
+Agent-generated scripts
+AST grep
+Python analysis
+安全隔离。
+5. Knowledge Base
+CodeRabbit Knowledge Base
+这是研究它如何构建“长期记忆 + 企业上下文”的入口。
+6. Verification / Custom Checks
+CodeRabbit Custom Checks
+这篇非常适合研究：
+Analyze
+→ Gather Evidence
+→ Verify
+→ Pass / Fail
+的 Agent Harness 模式。
+7. Path / AST Instructions
+Path-based review instructions
+AST-based path instructions
+适合研究 Review Policy Engine。
+三十、最后给你一个“CodeRabbit 实现思想”的一句话版本
+如果把所有公开资料压缩成一句：
+CodeRabbit = Deterministic Code Intelligence + Context Engineering + Agentic Investigation + Multi-Agent Verification + Isolated Execution + Persistent Review Memory + Continuous Evaluation。
+而不是：
+CodeRabbit = GPT/Claude + git diff。
+对于你现在正在研究的 Harness-based Code Review，我认为最值得进一步拆的是这 4 个部分：
+① Context Engine 怎么构建
+② Reviewer / Verifier Agent 如何协同
+③ Sandbox + Tool Runtime 怎么设计
+④ Evaluation Harness 怎么定义 recall / precision
+这四块基本决定了一个“AI Code Review”产品能不能从 Demo 走向生产。
+下一步最有价值的是直接把 CodeRabbit 的整个 Review Pipeline 反向拆成一张“可实现架构图”：包括 Orchestrator / Context Engine / Code Graph / Tool Registry / Review Agent / Verification Agent / Memory / Eval Harness 的类、接口、事件流，以及给出一套 Python/TypeScript 可落地的 Harness 目录结构。
