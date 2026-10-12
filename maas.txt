@@ -1,0 +1,17 @@
+火山AI网关地址（适用于通过外部网络接入蓝区模型）
+
+OpenAI协议地址，chat格式：
+	https://st8tp3ajl0df3n8b8l8qu.apigateway-cn-beijing.volceapi.com/v1
+
+OpenAI协议地址，Responses格式(仅部分模型支持)：
+	https://st8tp3ajl0df3n8b8l8qu.apigateway-cn-beijing.volceapi.com/v1/responses
+	# Responses 格式作为Chat Completions API的演进版本，Responses API能够以更简洁的方式提供智能体原生功能；
+	# 蓝区当前仅有部分模型提供了该格式的支持，常用AI工具也只有部分能支持（如codex支持，Trae不支持），请注意识别。
+
+Anthropic协议地址：
+	https://st8tp3ajl0df3n8b8l8qu.apigateway-cn-beijing.volceapi.com/compatible
+
+OpenCode配置文件示例：
+	https://gitcode.com/Operations_Blue/config/blob/main/opencode.json
+
+00c5cca8-f638-41aa-ae24-97dc652ef349
